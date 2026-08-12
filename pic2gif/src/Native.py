@@ -1,5 +1,6 @@
 import os # noqa: N999
 import ctypes # noqa: N999
+import threading # noqa: N999
 # pyright: reportMissingImports=false
 from android_utils import log # noqa: N999
 from file_utils import get_plugins_dir # noqa: N999
@@ -9,6 +10,10 @@ PLUGIN_FOLDER = "pic2gif"
 
 _archDir = None
 _libs = None
+_libsLock = threading.Lock()
+# libx264 + the whole pipeline is run one job at a time: several concurrent
+# encoders inside the host app is a lot of native memory for no benefit.
+_convertLock = threading.Lock()
 
 # AVPixelFormat vals
 AV_PIX_FMT_RGBA = 26
@@ -18,6 +23,19 @@ AV_PIX_FMT_YUV420P = 0
 AVIO_FLAG_WRITE = 2
 AV_ERROR_MAX_STRING_SIZE = 64
 AV_CODEC_FLAG_GLOBAL_HEADER = 1 << 22
+# libavcodec/defs.h - av_packet_from_data() assumes the buffer is
+# size + AV_INPUT_BUFFER_PADDING_SIZE bytes long and decoders read into it.
+AV_INPUT_BUFFER_PADDING_SIZE = 64
+
+# libavutil/error.h: AVERROR(e) == -e, AVERROR_EOF == FFERRTAG('E','O','F',' ')
+AVERROR_EAGAIN = -11
+AVERROR_EOF = -(ord("E") | (ord("O") << 8) | (ord("F") << 16) | (ord(" ") << 24))
+
+# Guard rails: an oversized picture would otherwise be decoded, scaled and fed
+# to x264 in one go and get the whole app OOM-killed.
+MAX_INPUT_BYTES = 32 * 1024 * 1024
+MAX_DIMENSION = 1280
+MAX_TOTAL_FRAMES = 300
 
 
 class AVRational(ctypes.Structure):
@@ -61,6 +79,8 @@ class AVCodecContext(ctypes.Structure):
         ("extradata", ctypes.c_void_p),
         ("extradata_size", ctypes.c_int),
         ("time_base", AVRational),
+        # present while FF_API_TICKS_PER_FRAME (LIBAVCODEC_VERSION_MAJOR < 61),
+        # which holds for the bundled avcodec 60
         ("ticks_per_frame", ctypes.c_int),
         ("delay", ctypes.c_int),
         ("width", ctypes.c_int),
@@ -117,6 +137,33 @@ class AVPacket(ctypes.Structure):
 class FFmpegError(Exception): pass
 
 
+class _Scope:
+    """LIFO cleanup stack.
+
+    Every native allocation is registered here the moment it succeeds, so any
+    exception path frees everything instead of leaking a codec context, an
+    AVIOContext (and its fd) or a decoded frame.
+    """
+
+    def __init__(self):
+        self._cleanups = []
+
+    def push(self, fn):
+        self._cleanups.append(fn)
+        return fn
+
+    def release(self, fn):
+        """Drop a cleanup because ownership moved elsewhere."""
+        try: self._cleanups.remove(fn)
+        except ValueError: pass
+
+    def close(self):
+        while self._cleanups:
+            fn = self._cleanups.pop()
+            try: fn()
+            except Exception as e: log(f"p2g: cleanup step failed: {e}")
+
+
 def _resolveArchDir():
     global _archDir
     if _archDir is not None:
@@ -137,17 +184,34 @@ def _loadLibs():
     if _libs is not None:
         return _libs
 
-    libDir = _resolveArchDir()
+    with _libsLock:
+        if _libs is not None:
+            return _libs
 
-    avutil = ctypes.CDLL(os.path.join(libDir, "libavutil.so"), mode=ctypes.RTLD_GLOBAL)
-    avcodec = ctypes.CDLL(os.path.join(libDir, "libavcodec.so"), mode=ctypes.RTLD_GLOBAL)
-    avformat = ctypes.CDLL(os.path.join(libDir, "libavformat.so"), mode=ctypes.RTLD_GLOBAL)
-    swscale = ctypes.CDLL(os.path.join(libDir, "libswscale.so"), mode=ctypes.RTLD_GLOBAL)
+        libDir = _resolveArchDir()
+        names = ["libavutil.so", "libavcodec.so", "libavformat.so", "libswscale.so"]
 
-    _declareSignatures(avutil, avcodec, avformat, swscale)
-    _libs = (avutil, avcodec, avformat, swscale)
-    log("p2g: ffmpeg libraries loaded")
-    return _libs
+        # RTLD_LOCAL keeps our av_* symbols out of the process-wide global
+        # group, so they can never interpose on the FFmpeg the host app links
+        # itself. Inter-library DT_NEEDED refs still resolve: they are version
+        # tagged (av_malloc@LIBAVUTIL_58) and the linker matches the already
+        # loaded soname inside the namespace. RTLD_GLOBAL stays as a fallback
+        # in case some ROM's linker disagrees.
+        loaded = None
+        for mode in (ctypes.RTLD_LOCAL, ctypes.RTLD_GLOBAL):
+            try:
+                loaded = [ctypes.CDLL(os.path.join(libDir, n), mode=mode) for n in names]
+                break
+            except OSError as e:
+                log(f"p2g: loading ffmpeg with mode {mode} failed: {e}")
+        if loaded is None:
+            raise FFmpegError("failed to load bundled ffmpeg libraries")
+
+        avutil, avcodec, avformat, swscale = loaded
+        _declareSignatures(avutil, avcodec, avformat, swscale)
+        _libs = (avutil, avcodec, avformat, swscale)
+        log("p2g: ffmpeg libraries loaded")
+        return _libs
 
 
 def _declareSignatures(avutil, avcodec, avformat, swscale):
@@ -155,11 +219,18 @@ def _declareSignatures(avutil, avcodec, avformat, swscale):
     c_int = ctypes.c_int
     c_char_p = ctypes.c_char_p
 
+    avutil.av_malloc.argtypes = [ctypes.c_size_t]
+    avutil.av_malloc.restype = c_void_p
+    avutil.av_freep.argtypes = [c_void_p]
+    avutil.av_freep.restype = None
+
     avutil.av_frame_alloc.restype = ctypes.POINTER(AVFrame)
     avutil.av_frame_free.argtypes = [ctypes.POINTER(ctypes.POINTER(AVFrame))]
     avutil.av_frame_get_buffer.argtypes = [ctypes.POINTER(AVFrame), c_int]
     avutil.av_frame_get_buffer.restype = c_int
     avutil.av_frame_unref.argtypes = [ctypes.POINTER(AVFrame)]
+    avutil.av_frame_make_writable.argtypes = [ctypes.POINTER(AVFrame)]
+    avutil.av_frame_make_writable.restype = c_int
 
     avutil.av_strerror.argtypes = [c_int, c_char_p, ctypes.c_size_t]
     avutil.av_strerror.restype = c_int
@@ -193,6 +264,8 @@ def _declareSignatures(avutil, avcodec, avformat, swscale):
     avcodec.av_packet_from_data.argtypes = [ctypes.POINTER(AVPacket), c_void_p, c_int]
     avcodec.av_packet_from_data.restype = c_int
     avcodec.av_packet_unref.argtypes = [ctypes.POINTER(AVPacket)]
+    avcodec.av_packet_rescale_ts.argtypes = [ctypes.POINTER(AVPacket), AVRational, AVRational]
+    avcodec.av_packet_rescale_ts.restype = None
 
     avcodec.avcodec_parameters_from_context.argtypes = [c_void_p, ctypes.POINTER(AVCodecContext)]
     avcodec.avcodec_parameters_from_context.restype = c_int
@@ -227,6 +300,7 @@ def _declareSignatures(avutil, avcodec, avformat, swscale):
     ]
     swscale.sws_getContext.restype = c_void_p
     swscale.sws_freeContext.argtypes = [c_void_p]
+    swscale.sws_freeContext.restype = None
     swscale.sws_scale_frame.argtypes = [c_void_p, ctypes.POINTER(AVFrame), ctypes.POINTER(AVFrame)]
     swscale.sws_scale_frame.restype = c_int
 
@@ -237,46 +311,93 @@ def _errStr(avutil, code):
     return buf.value.decode("utf-8", "replace")
 
 
-def _decodeImage(avutil, avcodec, inputPath, decoderName): # frame, ctx, pkt, buf
+def _readInput(inputPath):
+    size = os.path.getsize(inputPath)
+    if size <= 0:
+        raise FFmpegError("input file is empty")
+    if size > MAX_INPUT_BYTES:
+        raise FFmpegError(f"input file too large: {size} bytes")
+
     with open(inputPath, "rb") as f:
         raw = f.read()
+    if not raw:
+        raise FFmpegError("input file is empty")
+    return raw
+
+
+def _decodeImage(avutil, avcodec, inputPath, decoderName, scope):
+    """Decode a still image, returning a refcounted AVFrame owned by `scope`.
+
+    The decoder context and packet are torn down before returning; the frame
+    returned by avcodec_receive_frame owns its own buffers and outlives them.
+    """
+    raw = _readInput(inputPath)
+    size = len(raw)
 
     decoder = avcodec.avcodec_find_decoder_by_name(decoderName.encode())
     if not decoder:
         raise FFmpegError(f"decoder '{decoderName}' not found")
 
-    ctx = avcodec.avcodec_alloc_context3(decoder)
-    if not ctx:
-        raise FFmpegError("avcodec_alloc_context3 failed")
+    local = _Scope()
+    try:
+        ctx = avcodec.avcodec_alloc_context3(decoder)
+        if not ctx:
+            raise FFmpegError("avcodec_alloc_context3 failed")
+        local.push(lambda: avcodec.avcodec_free_context(ctypes.byref(ctx)))
 
-    ret = avcodec.avcodec_open2(ctx, decoder, None)
-    if ret < 0:
-        avcodec.avcodec_free_context(ctypes.byref(ctx))
-        raise FFmpegError(f"avcodec_open2 failed: {_errStr(avutil, ret)}")
+        ret = avcodec.avcodec_open2(ctx, decoder, None)
+        if ret < 0:
+            raise FFmpegError(f"avcodec_open2 failed: {_errStr(avutil, ret)}")
 
-    pkt = avcodec.av_packet_alloc()
-    buf = ctypes.create_string_buffer(raw, len(raw))
-    ret = avcodec.av_packet_from_data(pkt, ctypes.cast(buf, ctypes.c_void_p), len(raw))
-    if ret < 0:
-        avcodec.avcodec_free_context(ctypes.byref(ctx))
-        raise FFmpegError(f"av_packet_from_data failed: {_errStr(avutil, ret)}")
+        pkt = avcodec.av_packet_alloc()
+        if not pkt:
+            raise FFmpegError("av_packet_alloc failed")
+        local.push(lambda: avcodec.av_packet_free(ctypes.byref(pkt)))
 
-    ret = avcodec.avcodec_send_packet(ctx, pkt)
-    if ret < 0:
-        avcodec.avcodec_free_context(ctypes.byref(ctx))
-        raise FFmpegError(f"avcodec_send_packet failed: {_errStr(avutil, ret)}")
+        # av_packet_from_data() hands the buffer to an AVBuffer that will later
+        # release it with av_free(), so it MUST come from av_malloc() - passing
+        # CPython-owned memory here corrupts the native heap. It also requires
+        # AV_INPUT_BUFFER_PADDING_SIZE zeroed bytes past the payload, which
+        # decoders read as part of their bitstream over-read.
+        data = ctypes.c_void_p(avutil.av_malloc(size + AV_INPUT_BUFFER_PADDING_SIZE))
+        if not data:
+            raise FFmpegError("av_malloc failed")
+        freeData = local.push(lambda: avutil.av_freep(ctypes.byref(data)))
+        ctypes.memmove(data, raw, size)
+        ctypes.memset(ctypes.c_void_p(data.value + size), 0, AV_INPUT_BUFFER_PADDING_SIZE)
 
-    frame = avutil.av_frame_alloc()
-    ret = avcodec.avcodec_receive_frame(ctx, frame)
-    if ret < 0:
-        avutil.av_frame_free(ctypes.byref(frame))
-        avcodec.avcodec_free_context(ctypes.byref(ctx))
-        raise FFmpegError(f"avcodec_receive_frame failed: {_errStr(avutil, ret)}")
+        ret = avcodec.av_packet_from_data(pkt, data, size)
+        if ret < 0:
+            raise FFmpegError(f"av_packet_from_data failed: {_errStr(avutil, ret)}")
+        # the packet owns the buffer now; av_packet_free will release it
+        local.release(freeData)
 
-    return frame, ctx, pkt, buf
+        ret = avcodec.avcodec_send_packet(ctx, pkt)
+        if ret < 0:
+            raise FFmpegError(f"avcodec_send_packet failed: {_errStr(avutil, ret)}")
+
+        frame = avutil.av_frame_alloc()
+        if not frame:
+            raise FFmpegError("av_frame_alloc failed")
+        scope.push(lambda: avutil.av_frame_free(ctypes.byref(frame)))
+
+        ret = avcodec.avcodec_receive_frame(ctx, frame)
+        if ret == AVERROR_EAGAIN:
+            # some decoders only emit after being drained
+            avcodec.avcodec_send_packet(ctx, None)
+            ret = avcodec.avcodec_receive_frame(ctx, frame)
+        if ret < 0:
+            raise FFmpegError(f"avcodec_receive_frame failed: {_errStr(avutil, ret)}")
+
+        if frame.contents.width <= 0 or frame.contents.height <= 0 or frame.contents.format < 0:
+            raise FFmpegError("decoder produced an unusable frame")
+
+        return frame
+    finally:
+        local.close()
 
 
-def _scaleFrame(avutil, swscale, srcFrame, dstW, dstH, dstFormat):
+def _scaleFrame(avutil, swscale, srcFrame, dstW, dstH, dstFormat, scope):
     swsCtx = swscale.sws_getContext(
         srcFrame.contents.width, srcFrame.contents.height, srcFrame.contents.format,
         dstW, dstH, dstFormat,
@@ -286,140 +407,198 @@ def _scaleFrame(avutil, swscale, srcFrame, dstW, dstH, dstFormat):
     if not swsCtx:
         raise FFmpegError("sws_getContext failed")
 
-    dstFrame = avutil.av_frame_alloc()
-    dstFrame.contents.width = dstW
-    dstFrame.contents.height = dstH
-    dstFrame.contents.format = dstFormat
+    local = _Scope()
+    local.push(lambda: swscale.sws_freeContext(swsCtx))
+    try:
+        dstFrame = avutil.av_frame_alloc()
+        if not dstFrame:
+            raise FFmpegError("av_frame_alloc failed")
+        scope.push(lambda: avutil.av_frame_free(ctypes.byref(dstFrame)))
 
-    ret = avutil.av_frame_get_buffer(dstFrame, 0)
-    if ret < 0:
-        swscale.sws_freeContext(swsCtx)
-        avutil.av_frame_free(ctypes.byref(dstFrame))
-        raise FFmpegError(f"av_frame_get_buffer failed: {_errStr(avutil, ret)}")
+        dstFrame.contents.width = dstW
+        dstFrame.contents.height = dstH
+        dstFrame.contents.format = dstFormat
 
-    ret = swscale.sws_scale_frame(swsCtx, dstFrame, srcFrame)
-    swscale.sws_freeContext(swsCtx)
-    if ret < 0:
-        avutil.av_frame_free(ctypes.byref(dstFrame))
-        raise FFmpegError(f"sws_scale_frame failed: {_errStr(avutil, ret)}")
+        ret = avutil.av_frame_get_buffer(dstFrame, 0)
+        if ret < 0:
+            raise FFmpegError(f"av_frame_get_buffer failed: {_errStr(avutil, ret)}")
 
-    return dstFrame
+        ret = swscale.sws_scale_frame(swsCtx, dstFrame, srcFrame)
+        if ret < 0:
+            raise FFmpegError(f"sws_scale_frame failed: {_errStr(avutil, ret)}")
+
+        return dstFrame
+    finally:
+        local.close()
+
+
+def _targetSize(srcW, srcH):
+    """Even, capped output dimensions - yuv420p and x264 both need even sides."""
+    longest = max(srcW, srcH)
+    if longest > MAX_DIMENSION:
+        srcW = max(1, (srcW * MAX_DIMENSION) // longest)
+        srcH = max(1, (srcH * MAX_DIMENSION) // longest)
+
+    dstW = (srcW // 2) * 2
+    dstH = (srcH // 2) * 2
+    if dstW < 2 or dstH < 2:
+        raise FFmpegError(f"image too small to encode: {srcW}x{srcH}")
+    return dstW, dstH
+
+
+def _drainEncoder(avutil, avcodec, avformat, encCtx, fmtCtx, stream, pkt, encTimeBase):
+    while True:
+        ret = avcodec.avcodec_receive_packet(encCtx, pkt)
+        if ret in (AVERROR_EAGAIN, AVERROR_EOF):
+            return
+        if ret < 0:
+            raise FFmpegError(f"avcodec_receive_packet failed: {_errStr(avutil, ret)}")
+
+        try:
+            pkt.contents.stream_index = stream.contents.index
+            # the muxer rewrites stream->time_base in avformat_write_header, so
+            # encoder timestamps have to be rescaled or the mp4 gets a bogus
+            # duration and plays back at the wrong speed
+            avcodec.av_packet_rescale_ts(pkt, encTimeBase, stream.contents.time_base)
+            ret = avformat.av_interleaved_write_frame(fmtCtx, pkt)
+            if ret < 0:
+                raise FFmpegError(f"av_interleaved_write_frame failed: {_errStr(avutil, ret)}")
+        finally:
+            avcodec.av_packet_unref(pkt)
 
 
 def convertToVideo(inputPath, outputPath, decoderName, fps=10, durationSeconds=1):
-    avutil, avcodec, avformat, swscale = _loadLibs()
+    with _convertLock:
+        return _convertToVideo(inputPath, outputPath, decoderName, fps, durationSeconds)
 
-    log("p2g: decoding image")
-    frame, decCtx, decPkt, _rawBuf = _decodeImage(avutil, avcodec, inputPath, decoderName)
 
-    dstW = (frame.contents.width // 2) * 2
-    dstH = (frame.contents.height // 2) * 2
-    if dstW <= 0 or dstH <= 0:
-        raise FFmpegError("invalid image dimensions after scaling")
-
-    log(f"p2g: scaling to {dstW}x{dstH} yuv420p")
-    scaledFrame = _scaleFrame(avutil, swscale, frame, dstW, dstH, AV_PIX_FMT_YUV420P)
-
-    log("p2g: allocating output context")
-    fmtCtx = ctypes.POINTER(AVFormatContext)()
-    ret = avformat.avformat_alloc_output_context2(ctypes.byref(fmtCtx), None, b"mp4", outputPath.encode())
-    if ret < 0:
-        raise FFmpegError(f"avformat_alloc_output_context2 failed: {_errStr(avutil, ret)}")
-
-    log("p2g: finding h264 encoder")
-    encoder = avcodec.avcodec_find_encoder_by_name(b"libx264")
-    if not encoder:
-        raise FFmpegError("libx264 encoder not found")
-
-    log("p2g: creating stream")
-    stream = avformat.avformat_new_stream(fmtCtx, encoder)
-    if not stream:
-        raise FFmpegError("avformat_new_stream failed")
-
-    log("p2g: allocating encoder context")
-    encCtx = avcodec.avcodec_alloc_context3(encoder)
-    if not encCtx:
-        raise FFmpegError("avcodec_alloc_context3 (encoder) failed")
-
-    log("p2g: configuring encoder context")
-    encCtx.contents.width = dstW
-    encCtx.contents.height = dstH
-    encCtx.contents.pix_fmt = AV_PIX_FMT_YUV420P
-    encCtx.contents.time_base = AVRational(1, fps)
-    encCtx.contents.gop_size = fps
-    encCtx.contents.bit_rate = 2_000_000
-    encCtx.contents.flags = encCtx.contents.flags | AV_CODEC_FLAG_GLOBAL_HEADER
-
-    avutil.av_opt_set(encCtx, b"threads", b"1", 0)
-
-    avutil.av_opt_set(encCtx.contents.priv_data, b"rc-lookahead", b"0", 0)
-    avutil.av_opt_set(encCtx.contents.priv_data, b"preset", b"ultrafast", 0)
-
-    log("p2g: opening encoder")
-    ret = avcodec.avcodec_open2(encCtx, encoder, None)
-    if ret < 0:
-        raise FFmpegError(f"avcodec_open2 (encoder) failed: {_errStr(avutil, ret)}")
-
-    log("p2g: copying codec parameters to stream")
-    avcodec.avcodec_parameters_from_context(stream.contents.codecpar, encCtx)
-    stream.contents.time_base = AVRational(1, fps)
-
-    log("p2g: opening avio")
-    avioCtx = ctypes.c_void_p()
-    ret = avformat.avio_open(ctypes.byref(avioCtx), outputPath.encode(), AVIO_FLAG_WRITE)
-    if ret < 0:
-        raise FFmpegError(f"avio_open failed: {_errStr(avutil, ret)}")
-    fmtCtx.contents.pb = avioCtx.value
-
-    log("p2g: writing header")
-    ret = avformat.avformat_write_header(fmtCtx, None)
-    if ret < 0:
-        raise FFmpegError(f"avformat_write_header failed: {_errStr(avutil, ret)}")
+def _convertToVideo(inputPath, outputPath, decoderName, fps, durationSeconds):
+    fps = int(fps)
+    durationSeconds = int(durationSeconds)
+    if fps < 1 or durationSeconds < 1:
+        raise FFmpegError(f"invalid fps/duration: {fps}/{durationSeconds}")
 
     totalFrames = fps * durationSeconds
-    outPkt = avcodec.av_packet_alloc()
+    if totalFrames > MAX_TOTAL_FRAMES:
+        raise FFmpegError(f"refusing to encode {totalFrames} frames")
 
-    for i in range(totalFrames):
-        log(f"p2g: encoding frame {i}")
-        scaledFrame.contents.pts = i
+    avutil, avcodec, avformat, swscale = _loadLibs()
 
-        ret = avcodec.avcodec_send_frame(encCtx, scaledFrame)
+    scope = _Scope()
+    try:
+        log("p2g: decoding image")
+        frame = _decodeImage(avutil, avcodec, inputPath, decoderName, scope)
+
+        dstW, dstH = _targetSize(frame.contents.width, frame.contents.height)
+
+        log(f"p2g: scaling to {dstW}x{dstH} yuv420p")
+        scaledFrame = _scaleFrame(avutil, swscale, frame, dstW, dstH, AV_PIX_FMT_YUV420P, scope)
+
+        log("p2g: allocating output context")
+        fmtCtx = ctypes.POINTER(AVFormatContext)()
+        ret = avformat.avformat_alloc_output_context2(ctypes.byref(fmtCtx), None, b"mp4", outputPath.encode())
+        if ret < 0 or not fmtCtx:
+            raise FFmpegError(f"avformat_alloc_output_context2 failed: {_errStr(avutil, ret)}")
+        scope.push(lambda: avformat.avformat_free_context(fmtCtx))
+
+        log("p2g: finding h264 encoder")
+        encoder = avcodec.avcodec_find_encoder_by_name(b"libx264")
+        if not encoder:
+            raise FFmpegError("libx264 encoder not found")
+
+        log("p2g: creating stream")
+        stream = avformat.avformat_new_stream(fmtCtx, encoder)
+        if not stream:
+            raise FFmpegError("avformat_new_stream failed")
+
+        log("p2g: allocating encoder context")
+        encCtx = avcodec.avcodec_alloc_context3(encoder)
+        if not encCtx:
+            raise FFmpegError("avcodec_alloc_context3 (encoder) failed")
+        scope.push(lambda: avcodec.avcodec_free_context(ctypes.byref(encCtx)))
+
+        log("p2g: configuring encoder context")
+        encTimeBase = AVRational(1, fps)
+        encCtx.contents.width = dstW
+        encCtx.contents.height = dstH
+        encCtx.contents.pix_fmt = AV_PIX_FMT_YUV420P
+        encCtx.contents.time_base = encTimeBase
+        encCtx.contents.gop_size = fps
+        encCtx.contents.bit_rate = 2_000_000
+        # mp4 always wants extradata out of band
+        encCtx.contents.flags = encCtx.contents.flags | AV_CODEC_FLAG_GLOBAL_HEADER
+
+        avutil.av_opt_set(encCtx, b"threads", b"1", 0)
+
+        privData = encCtx.contents.priv_data
+        if privData:
+            avutil.av_opt_set(ctypes.c_void_p(privData), b"rc-lookahead", b"0", 0)
+            avutil.av_opt_set(ctypes.c_void_p(privData), b"preset", b"ultrafast", 0)
+
+        log("p2g: opening encoder")
+        ret = avcodec.avcodec_open2(encCtx, encoder, None)
         if ret < 0:
-            raise FFmpegError(f"avcodec_send_frame failed: {_errStr(avutil, ret)}")
+            raise FFmpegError(f"avcodec_open2 (encoder) failed: {_errStr(avutil, ret)}")
 
-        while True:
-            ret = avcodec.avcodec_receive_packet(encCtx, outPkt)
+        log("p2g: copying codec parameters to stream")
+        ret = avcodec.avcodec_parameters_from_context(stream.contents.codecpar, encCtx)
+        if ret < 0:
+            raise FFmpegError(f"avcodec_parameters_from_context failed: {_errStr(avutil, ret)}")
+        stream.contents.time_base = encTimeBase
+
+        log("p2g: opening avio")
+        avioCtx = ctypes.c_void_p()
+        ret = avformat.avio_open(ctypes.byref(avioCtx), outputPath.encode(), AVIO_FLAG_WRITE)
+        if ret < 0:
+            raise FFmpegError(f"avio_open failed: {_errStr(avutil, ret)}")
+        fmtCtx.contents.pb = avioCtx.value
+
+        def _closeAvio():
+            pb = ctypes.c_void_p(fmtCtx.contents.pb)
+            fmtCtx.contents.pb = None
+            if pb: avformat.avio_closep(ctypes.byref(pb))
+        scope.push(_closeAvio)
+
+        log("p2g: writing header")
+        ret = avformat.avformat_write_header(fmtCtx, None)
+        if ret < 0:
+            raise FFmpegError(f"avformat_write_header failed: {_errStr(avutil, ret)}")
+
+        outPkt = avcodec.av_packet_alloc()
+        if not outPkt:
+            raise FFmpegError("av_packet_alloc (output) failed")
+        scope.push(lambda: avcodec.av_packet_free(ctypes.byref(outPkt)))
+
+        for i in range(totalFrames):
+            # the encoder may still hold a reference to the frame we sent last
+            # round; make_writable is a no-op when it does not
+            ret = avutil.av_frame_make_writable(scaledFrame)
             if ret < 0:
-                break
-            outPkt.contents.stream_index = stream.contents.index
-            avformat.av_interleaved_write_frame(fmtCtx, outPkt)
-            avcodec.av_packet_unref(outPkt)
+                raise FFmpegError(f"av_frame_make_writable failed: {_errStr(avutil, ret)}")
+            scaledFrame.contents.pts = i
 
-    log("p2g: flushing encoder")
-    avcodec.avcodec_send_frame(encCtx, None)
-    while True:
-        ret = avcodec.avcodec_receive_packet(encCtx, outPkt)
+            ret = avcodec.avcodec_send_frame(encCtx, scaledFrame)
+            if ret == AVERROR_EAGAIN:
+                _drainEncoder(avutil, avcodec, avformat, encCtx, fmtCtx, stream, outPkt, encTimeBase)
+                ret = avcodec.avcodec_send_frame(encCtx, scaledFrame)
+            if ret < 0:
+                raise FFmpegError(f"avcodec_send_frame failed: {_errStr(avutil, ret)}")
+
+            _drainEncoder(avutil, avcodec, avformat, encCtx, fmtCtx, stream, outPkt, encTimeBase)
+
+        log("p2g: flushing encoder")
+        ret = avcodec.avcodec_send_frame(encCtx, None)
+        if ret < 0 and ret != AVERROR_EOF:
+            raise FFmpegError(f"avcodec_send_frame (flush) failed: {_errStr(avutil, ret)}")
+        _drainEncoder(avutil, avcodec, avformat, encCtx, fmtCtx, stream, outPkt, encTimeBase)
+
+        log("p2g: writing trailer")
+        ret = avformat.av_write_trailer(fmtCtx)
         if ret < 0:
-            break
-        outPkt.contents.stream_index = stream.contents.index
-        avformat.av_interleaved_write_frame(fmtCtx, outPkt)
-        avcodec.av_packet_unref(outPkt)
+            raise FFmpegError(f"av_write_trailer failed: {_errStr(avutil, ret)}")
 
-    log("p2g: writing trailer")
-    avformat.av_write_trailer(fmtCtx)
-
-    log("p2g: cleaning up")
-    avcodec.av_packet_free(ctypes.byref(outPkt))
-    avioCtx.value = fmtCtx.contents.pb
-    avformat.avio_closep(ctypes.byref(avioCtx))
-    avcodec.avcodec_free_context(ctypes.byref(encCtx))
-    avformat.avformat_free_context(fmtCtx)
-
-    avutil.av_frame_free(ctypes.byref(scaledFrame))
-    avutil.av_frame_free(ctypes.byref(frame))
-    avcodec.av_packet_free(ctypes.byref(decPkt))
-    avcodec.avcodec_free_context(ctypes.byref(decCtx))
-
-    log(f"p2g: video written to {outputPath}")
-
-    return dstW, dstH
+        log(f"p2g: video written to {outputPath}")
+        return dstW, dstH
+    finally:
+        log("p2g: cleaning up")
+        scope.close()

@@ -1,2 +1,4 @@
 .elyx/
 builds/
+__pycache__/
+*.pyc

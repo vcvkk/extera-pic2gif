@@ -1,7 +1,10 @@
 # pyright: reportMissingImports=false
 
 import os # noqa: N999
+import time # noqa: N999
 import uuid # noqa: N999
+import shutil # noqa: N999
+import threading # noqa: N999
 import traceback # noqa: N999
 
 from android_utils import log, run_on_ui_thread # noqa: N999
@@ -29,21 +32,98 @@ SUPPORTED_FORMATS = {
 FPS = 10
 DURATION_SECONDS = 1
 
+MAX_SOURCE_BYTES = 32 * 1024 * 1024
+STALE_TEMP_SECONDS = 60 * 60
+JOB_TIMEOUT_SECONDS = 120
+
+
+class _JobGate:
+    """Admits one conversion at a time.
+
+    Spamming the command otherwise piles up decoded frames and x264 encoders in
+    native memory. The deadline makes the gate self-healing: if a job is ever
+    lost before it can release (queue drops the task, process hiccup) the slot
+    frees itself instead of disabling the plugin until restart.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._startedAt = None
+
+    def tryAcquire(self):
+        with self._lock:
+            now = time.monotonic()
+            if self._startedAt is not None and now - self._startedAt < JOB_TIMEOUT_SECONDS:
+                return False
+            self._startedAt = now
+            return True
+
+    def release(self):
+        with self._lock:
+            self._startedAt = None
+
+
+_gate = _JobGate()
+
+
+def _showError(text):
+    """Bulletins touch the view hierarchy, so they must run on the UI thread.
+
+    Conversions run on a background queue; calling into the UI toolkit from
+    there is undefined behaviour and can take the process down natively.
+    """
+    try:
+        run_on_ui_thread(lambda: BulletinHelper.show_error(text))
+    except Exception as e:
+        log(f"p2g: failed to show bulletin: {e}")
+
+
 def _tempDir():
     tempDir = os.path.join(get_plugins_dir(), "pic2gif_temp")
     ensure_dir_exists(tempDir)
     return tempDir
 
+
+def _cleanStaleTemp(tempDir):
+    """Drop leftovers from jobs that died before their finally block ran."""
+    cutoff = time.time() - STALE_TEMP_SECONDS
+    try:
+        entries = os.listdir(tempDir)
+    except OSError as e:
+        log(f"p2g: cannot list temp dir: {e}")
+        return
+
+    for name in entries:
+        path = os.path.join(tempDir, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError as e:
+            log(f"p2g: stale temp cleanup failed for {path}: {e}")
+
+
+def _removeQuietly(path):
+    try:
+        if path and os.path.exists(path): os.remove(path)
+    except OSError as e:
+        log(f"p2g: temp cleanup failed for {path}: {e}")
+
+
 def _detectFormat(filePath):
     ext = os.path.splitext(filePath)[1].lower()
     return SUPPORTED_FORMATS.get(ext)
 
-def _getReplyPhotoPath(replyMessage):
-    if not replyMessage.isPhoto(): return None
-    file = get_file_loader().getPathToMessage(replyMessage.messageOwner)
-    if file is None or not file.exists(): return None
 
-    return file.getAbsolutePath()
+def _getReplyPhotoPath(replyMessage):
+    try:
+        if not replyMessage.isPhoto(): return None
+        file = get_file_loader().getPathToMessage(replyMessage.messageOwner)
+        if file is None or not file.exists(): return None
+
+        return file.getAbsolutePath()
+    except Exception as e:
+        log(f"p2g: cannot resolve reply photo path: {e}")
+        return None
 
 
 def _buildVideoDocument(filePath, width, height, durationSeconds):
@@ -108,27 +188,47 @@ def _sendVideoDocument(peer, filePath, width, height, durationSeconds, replyMess
     run_on_ui_thread(lambda: sendMessagesHelper.sendMessage(messageParams))
 
 
-def _convertAndSend(peer, sourcePath, decoderName, replyMessage):
-    tempDir = _tempDir()
-    jobId = uuid.uuid4().hex
-    inputCopy = os.path.join(tempDir, f"{jobId}{os.path.splitext(sourcePath)[1].lower()}")
-    outputVideo = os.path.join(tempDir, f"{jobId}.mp4")
+def _copySource(sourcePath, inputCopy):
+    size = os.path.getsize(sourcePath)
+    if size <= 0:
+        raise ValueError("source photo is empty")
+    if size > MAX_SOURCE_BYTES:
+        raise ValueError(f"source photo too large: {size} bytes")
 
+    # chunked: reading a 30 MB photo into a Python bytes object just to write it
+    # straight back out doubles peak memory for no reason
+    with open(sourcePath, "rb") as src, open(inputCopy, "wb") as dst:
+        shutil.copyfileobj(src, dst, 1024 * 1024)
+
+
+def _convertAndSend(peer, sourcePath, decoderName, replyMessage):
+    inputCopy = None
+    outputVideo = None
+    sent = False
     try:
-        with open(sourcePath, "rb") as src, open(inputCopy, "wb") as dst:
-            dst.write(src.read())
+        tempDir = _tempDir()
+        _cleanStaleTemp(tempDir)
+
+        jobId = uuid.uuid4().hex
+        inputCopy = os.path.join(tempDir, f"{jobId}{os.path.splitext(sourcePath)[1].lower()}")
+        outputVideo = os.path.join(tempDir, f"{jobId}.mp4")
+
+        _copySource(sourcePath, inputCopy)
 
         width, height = Native.convertToVideo(inputCopy, outputVideo, decoderName, fps=FPS, durationSeconds=DURATION_SECONDS)
 
         _sendVideoDocument(peer, outputVideo, width, height, DURATION_SECONDS, replyMessage)
+        sent = True
     except Exception as e:
         log(f"p2g: conversion failed: {e}")
         log(traceback.format_exc())
-        BulletinHelper.show_error("Failed to create GIF")
+        _showError("Failed to create GIF")
     finally:
-        try:
-            if os.path.exists(inputCopy): os.remove(inputCopy)
-        except Exception as e: log(f"p2g: temp cleanup failed for {inputCopy}: {e}")
+        _removeQuietly(inputCopy)
+        # the sender owns the mp4 once handed over; otherwise it would sit in
+        # the temp dir forever
+        if not sent: _removeQuietly(outputVideo)
+        _gate.release()
 
 
 def handleSendMessageHook(params):
@@ -138,21 +238,33 @@ def handleSendMessageHook(params):
 
     replyMessage = getattr(params, "replyToMsg", None)
     if replyMessage is None:
-        BulletinHelper.show_error("Reply to photo file")
+        _showError("Reply to photo file")
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    peer = getattr(params, "peer", None)
+    if peer is None:
+        _showError("Cannot resolve chat")
         return HookResult(strategy=HookStrategy.CANCEL)
 
     photoPath = _getReplyPhotoPath(replyMessage)
     if photoPath is None:
-        BulletinHelper.show_error("Reply to photo file")
+        _showError("Reply to photo file")
         return HookResult(strategy=HookStrategy.CANCEL)
 
     decoderName = _detectFormat(photoPath)
     if decoderName is None:
-        BulletinHelper.show_error("Unsupported photo format (.png/.jpg/.jpeg)")
+        _showError("Unsupported photo format (.png/.jpg/.jpeg)")
         return HookResult(strategy=HookStrategy.CANCEL)
 
-    peer = params.peer
+    if not _gate.tryAcquire():
+        _showError("Already making a GIF, wait a moment")
+        return HookResult(strategy=HookStrategy.CANCEL)
 
-    run_on_queue(lambda: _convertAndSend(peer, photoPath, decoderName, replyMessage))
+    try:
+        run_on_queue(lambda: _convertAndSend(peer, photoPath, decoderName, replyMessage))
+    except Exception as e:
+        _gate.release()
+        log(f"p2g: failed to queue conversion: {e}")
+        _showError("Failed to create GIF")
 
     return HookResult(strategy=HookStrategy.CANCEL)

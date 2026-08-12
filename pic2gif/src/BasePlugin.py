@@ -1,3 +1,5 @@
+import traceback # noqa: N999
+
 from base_plugin import BasePlugin, HookResult # noqa: N999
 from android_utils import log # noqa: N999
 from . import Main # noqa: N999
@@ -12,4 +14,11 @@ class pic2gifMain(BasePlugin):
         log("p2g: plugin unloaded")
 
     def on_send_message_hook(self, account, params) -> HookResult:
-        return Main.handleSendMessageHook(params)
+        # this hook sits on the app's send path: letting an exception escape
+        # would break sending ordinary messages, so it never propagates
+        try:
+            return Main.handleSendMessageHook(params)
+        except Exception as e:
+            log(f"p2g: send message hook failed: {e}")
+            log(traceback.format_exc())
+            return HookResult()
