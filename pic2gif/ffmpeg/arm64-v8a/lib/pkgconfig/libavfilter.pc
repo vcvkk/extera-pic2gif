@@ -1,0 +1,14 @@
+prefix=/home/shareui/temp/ff/build/arm64-v8a
+exec_prefix=${prefix}
+libdir=/home/shareui/temp/ff/build/arm64-v8a/lib
+includedir=/home/shareui/temp/ff/build/arm64-v8a/include
+
+Name: libavfilter
+Description: FFmpeg audio/video filtering library
+Version: 9.12.100
+Requires: 
+Requires.private: libswscale >= 7.5.100, libavformat >= 60.16.101, libavcodec >= 60.31.102, libavutil >= 58.29.100
+Conflicts:
+Libs: -L${libdir}  -lavfilter 
+Libs.private: -pthread -lm -latomic
+Cflags: -I${includedir}

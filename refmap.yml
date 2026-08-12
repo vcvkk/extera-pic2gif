@@ -1,0 +1,5 @@
+metainfo: pic2gif/meta.yml
+main: pic2gif/src/BasePlugin.py
+assets: pic2gif/res
+strings: pic2gif/locales
+elyxbuilder: pic2gif/.elyxbuilder

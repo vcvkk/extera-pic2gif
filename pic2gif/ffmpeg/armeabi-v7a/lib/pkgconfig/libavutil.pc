@@ -1,0 +1,14 @@
+prefix=/home/shareui/temp/ff/build/armeabi-v7a
+exec_prefix=${prefix}
+libdir=/home/shareui/temp/ff/build/armeabi-v7a/lib
+includedir=/home/shareui/temp/ff/build/armeabi-v7a/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 58.29.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: -pthread -lm -latomic -landroid
+Cflags: -I${includedir}

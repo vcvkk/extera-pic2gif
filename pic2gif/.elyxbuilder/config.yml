@@ -1,0 +1,16 @@
+zipFormat: eaf
+source: pic2gif/src
+buildNameUncompiled: '{name}-{version}'
+buildNameCompiled: '{name}-{version}-3.11'
+ignoreAll:
+- pic2gif/.elyxbuilder/cache/*
+compilationIgnore:
+- pic2gif/src/BasePlugin.py
+obfuscationConfig:
+  stripDocstrings: true
+  removeLogs: true
+  renameLocals: true
+  encodeStrings: true
+  encodeNumbers: true
+  zlibCompression: false
+  saveMapping: true

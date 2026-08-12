@@ -1,0 +1,7 @@
+name: pic2gif
+description: "**UNSTABLE**\n{description}"
+id: shareui_ptg
+version: "0.1.0-unstable"
+author: "@shareui"
+app_version: ">=12.9.0"
+sdk_version: ">=1.4.5.1"
